@@ -77,4 +77,3 @@ class Client:
     def close(self):
         if self._client:
             self._client.close()
-
