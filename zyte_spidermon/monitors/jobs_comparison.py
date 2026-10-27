@@ -1,24 +1,25 @@
-import datetime
 import json
 import math
 import os
 
-from .utils import Client
-
-from spidermon import Monitor, monitors
+from spidermon import monitors
+from spidermon.contrib.scrapy.monitors.base import BaseStatMonitor
 from spidermon.exceptions import NotConfigured
-from spidermon.utils.settings import getdictorlist
-from spidermon.contrib.monitors.mixins.stats import StatsMonitorMixin
-from spidermon.contrib.scrapy.monitors.base import BaseScrapyMonitor, BaseStatMonitor
 
+from ..utils import Client
 
 SPIDERMON_JOBS_COMPARISON = "SPIDERMON_JOBS_COMPARISON"
 SPIDERMON_JOBS_COMPARISON_STATES = "SPIDERMON_JOBS_COMPARISON_STATES"
 SPIDERMON_JOBS_COMPARISON_TAGS = "SPIDERMON_JOBS_COMPARISON_TAGS"
+SPIDERMON_JOBS_COMPARISON_CLOSE_REASONS = "SPIDERMON_JOBS_COMPARISON_CLOSE_REASONS"
 SPIDERMON_JOBS_COMPARISON_THRESHOLD = "SPIDERMON_JOBS_COMPARISON_THRESHOLD"
+SPIDERMON_JOBS_COMPARISON_ARGUMENTS = "SPIDERMON_JOBS_COMPARISON_ARGUMENTS"
+SPIDERMON_JOBS_COMPARISON_ARGUMENTS_ENABLED = (
+    "SPIDERMON_JOBS_COMPARISON_ARGUMENTS_ENABLED"
+)
 
 
-monitors.name("Jobs Comparison Monitor")
+@monitors.name("Jobs Comparison Monitor")
 class ZyteJobsComparisonMonitor(BaseStatMonitor):
     """
     .. note::
@@ -41,6 +42,18 @@ class ZyteJobsComparisonMonitor(BaseStatMonitor):
     You can also filter which jobs to compare based on their tags using the
     ``SPIDERMON_JOBS_COMPARISON_TAGS`` setting. Among the defined tags we consider only those
     that are also present in the current job.
+
+    You can also filter which jobs to compare based on their close reason using the
+    ``SPIDERMON_JOBS_COMPARISON_CLOSE_REASONS`` setting. The default value is ``()``,
+    which doesn't filter any job based on close_reason. To only consider successfully finished jobs,
+    use ``("finished", )`` instead.
+
+    You can also filter which jobs to compare based on the job arguments using the
+    ``SPIDERMON_JOBS_COMPARISON_ARGUMENTS`` setting. It will filter any job based on spider_args.
+    The job that will have all the desired arguments will be processed.
+    Example {"debug_url": "https://www.google.com"} or {"is_full_crawl": True}
+    You can enable this filter by setting SPIDERMON_JOBS_COMPARISON_ARGUMENTS_ENABLED as True in the settings.
+    Otherwise, this filter will not be applied.
     """
 
     stat_name = "item_scraped_count"
@@ -69,43 +82,86 @@ class ZyteJobsComparisonMonitor(BaseStatMonitor):
 
     def _get_jobs(self, states, number_of_jobs):
         tags = self._get_tags_to_filter()
+        close_reasons = self.crawler.settings.getlist(
+            SPIDERMON_JOBS_COMPARISON_CLOSE_REASONS, ()
+        )
+        args = self._get_args_to_filter()
+        args_enabled = self.crawler.settings.getbool(
+            SPIDERMON_JOBS_COMPARISON_ARGUMENTS_ENABLED, False
+        )
 
-        jobs = []
+        total_jobs = []
         start = 0
         client = Client(self.crawler.settings)
+        MAX_API_COUNT = 1000
 
-        _jobs = client.spider.jobs.list(
-            start=start,
-            state=states,
-            count=number_of_jobs,
-            filters=dict(has_tag=tags) if tags else None,
-        )
-        while _jobs:
-            jobs.extend(_jobs)
-            start += 1000
-            _jobs = client.spider.jobs.list(
+        while True:
+            # API has a 1000 results limit
+            count = min(number_of_jobs - len(total_jobs), MAX_API_COUNT)
+            current_jobs = client.spider.jobs.list(
                 start=start,
                 state=states,
-                count=number_of_jobs,
-                filters=dict(has_tag=tags) if tags else None,
+                count=count,
+                has_tag=tags or None,
             )
-        return jobs
+
+            for job in current_jobs:
+                if close_reasons and job.get("close_reason") not in close_reasons:
+                    continue
+
+                if args_enabled and not self._has_desired_args(job, args):
+                    continue
+
+                total_jobs.append(job)
+
+            if len(current_jobs) < MAX_API_COUNT or len(total_jobs) >= number_of_jobs:
+                # Stop paginating if results are less than 1000 (pagination not required)
+                # or target jobs was reached - no more pagination required
+                break
+
+            start += len(current_jobs)
+
+        return total_jobs
 
     def _get_tags_to_filter(self):
         """
-        Return the intersect of the desired tags to filter and
+        Return a list of tags with the intersection of the desired tags to filter and
         the ones from the current job.
         """
         desired_tags = self.crawler.settings.getlist(SPIDERMON_JOBS_COMPARISON_TAGS)
         if not desired_tags:
-            return {}
+            return []
 
         current_tags = json.loads(os.environ.get("SHUB_JOB_DATA", "{}")).get("tags")
         if not current_tags:
-            return {}
+            return []
 
         tags_to_filter = set(desired_tags) & set(current_tags)
         return sorted(tags_to_filter)
+
+    def _get_args_to_filter(self):
+        """
+        Return a list of desired arguments to filter
+        """
+        desired_args = self.crawler.settings.getdict(
+            SPIDERMON_JOBS_COMPARISON_ARGUMENTS
+        )
+        if not desired_args:
+            return {}
+
+        return desired_args
+
+    def _has_desired_args(self, job, args):
+        if not args and not job.get("spider_args"):
+            return True
+        elif not args and job.get("spider_args"):
+            return False
+
+        job_args = job["spider_args"].keys()
+        if not all(a in job_args for a in args):
+            return False
+
+        return args == job["spider_args"]
 
     def get_threshold(self):
         number_of_jobs = self.crawler.settings.getint(SPIDERMON_JOBS_COMPARISON)

@@ -1,11 +1,6 @@
 import os
 
-try:
-    from scrapinghub import ScrapinghubClient
-
-    HAS_CLIENT = True
-except ImportError:
-    HAS_CLIENT = False
+from scrapinghub import ScrapinghubClient
 
 
 class Client:
@@ -20,7 +15,7 @@ class Client:
     """
 
     def __init__(self, settings):
-        self.available = HAS_CLIENT and "SHUB_JOBKEY" in os.environ
+        self.available = "SHUB_JOBKEY" in os.environ
         self._client = None
         self._project = None
         self._spider = None
@@ -77,4 +72,3 @@ class Client:
     def close(self):
         if self._client:
             self._client.close()
-
